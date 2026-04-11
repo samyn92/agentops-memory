@@ -13,6 +13,21 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// maxRequestBodyBytes limits incoming request bodies to 1 MiB.
+const maxRequestBodyBytes = 1 << 20 // 1 MiB
+
+// maxFieldLengths for input validation.
+const (
+	maxTitleLen   = 500
+	maxContentLen = 50_000
+	maxTopicLen   = 200
+	maxScopeLen   = 50
+	maxTypeLen    = 50
+	maxTagLen     = 100
+	maxTagCount   = 20
+	maxProjectLen = 200
+)
+
 // Server is the HTTP handler for the memory service.
 type Server struct {
 	store *Store
@@ -79,6 +94,14 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if err := decodeJSON(r, &req); err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Validate required fields
+	if errs := validateSession(&req); len(errs) > 0 {
+		msg := "validation failed: " + strings.Join(errs, "; ")
+		span.SetStatus(codes.Error, msg)
+		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
 
@@ -161,6 +184,14 @@ func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
 	if err := decodeJSON(r, &req); err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Validate required fields
+	if errs := validateObservation(&req); len(errs) > 0 {
+		msg := "validation failed: " + strings.Join(errs, "; ")
+		span.SetStatus(codes.Error, msg)
+		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
 
@@ -518,12 +549,72 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 }
 
 func decodeJSON(r *http.Request, v any) error {
+	// Limit request body size to prevent memory exhaustion
+	r.Body = http.MaxBytesReader(nil, r.Body, maxRequestBodyBytes)
 	defer r.Body.Close()
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(v); err != nil {
 		return fmt.Errorf("invalid JSON: %w", err)
 	}
 	return nil
+}
+
+// validateObservation checks required fields and length limits.
+func validateObservation(req *CreateObservationRequest) []string {
+	var errs []string
+	if strings.TrimSpace(req.SessionID) == "" {
+		errs = append(errs, "session_id is required")
+	}
+	if strings.TrimSpace(req.Type) == "" {
+		errs = append(errs, "type is required")
+	} else if len(req.Type) > maxTypeLen {
+		errs = append(errs, fmt.Sprintf("type exceeds %d chars", maxTypeLen))
+	}
+	if strings.TrimSpace(req.Title) == "" {
+		errs = append(errs, "title is required")
+	} else if len(req.Title) > maxTitleLen {
+		errs = append(errs, fmt.Sprintf("title exceeds %d chars", maxTitleLen))
+	}
+	if strings.TrimSpace(req.Content) == "" {
+		errs = append(errs, "content is required")
+	} else if len(req.Content) > maxContentLen {
+		errs = append(errs, fmt.Sprintf("content exceeds %d chars", maxContentLen))
+	}
+	if strings.TrimSpace(req.Project) == "" {
+		errs = append(errs, "project is required")
+	} else if len(req.Project) > maxProjectLen {
+		errs = append(errs, fmt.Sprintf("project exceeds %d chars", maxProjectLen))
+	}
+	if req.Scope != "" && len(req.Scope) > maxScopeLen {
+		errs = append(errs, fmt.Sprintf("scope exceeds %d chars", maxScopeLen))
+	}
+	if req.TopicKey != "" && len(req.TopicKey) > maxTopicLen {
+		errs = append(errs, fmt.Sprintf("topic_key exceeds %d chars", maxTopicLen))
+	}
+	if len(req.Tags) > maxTagCount {
+		errs = append(errs, fmt.Sprintf("tags exceed %d items", maxTagCount))
+	}
+	for _, t := range req.Tags {
+		if len(t) > maxTagLen {
+			errs = append(errs, fmt.Sprintf("tag exceeds %d chars", maxTagLen))
+			break
+		}
+	}
+	return errs
+}
+
+// validateSession checks required fields for session creation.
+func validateSession(req *CreateSessionRequest) []string {
+	var errs []string
+	if strings.TrimSpace(req.ID) == "" {
+		errs = append(errs, "id is required")
+	}
+	if strings.TrimSpace(req.Project) == "" {
+		errs = append(errs, "project is required")
+	} else if len(req.Project) > maxProjectLen {
+		errs = append(errs, fmt.Sprintf("project exceeds %d chars", maxProjectLen))
+	}
+	return errs
 }
 
 func queryInt(r *http.Request, key string, defaultVal int) int {

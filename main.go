@@ -53,12 +53,6 @@ func main() {
 	}
 	defer store.Close()
 
-	// Initialize FTS5 (separate from schema because CREATE VIRTUAL TABLE can't use IF NOT EXISTS).
-	if err := store.initFTS(); err != nil {
-		slog.Error("failed to initialize FTS5", "error", err)
-		os.Exit(1)
-	}
-
 	// Start HTTP server.
 	server := NewServer(store)
 	httpServer := &http.Server{

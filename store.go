@@ -32,6 +32,10 @@ func NewStore(dbPath string, dedupeWindow time.Duration) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	if err := s.initFTS(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("init FTS5: %w", err)
+	}
 	return s, nil
 }
 
@@ -129,14 +133,15 @@ INSERT INTO observations_fts(observations_fts) VALUES('rebuild');
 
 func (s *Store) CreateSession(req CreateSessionRequest) (*Session, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
+	project := strings.ToLower(req.Project)
 	_, err := s.db.Exec(
 		`INSERT OR IGNORE INTO sessions (id, project, started_at) VALUES (?, ?, ?)`,
-		req.ID, strings.ToLower(req.Project), now,
+		req.ID, project, now,
 	)
 	if err != nil {
 		return nil, err
 	}
-	return &Session{ID: req.ID, Project: req.Project, StartedAt: now}, nil
+	return &Session{ID: req.ID, Project: project, StartedAt: now}, nil
 }
 
 func (s *Store) EndSession(sessionID string, messages []SessionMessage) (*EndSessionResponse, error) {
