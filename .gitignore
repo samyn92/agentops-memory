@@ -1,0 +1,9 @@
+# Binaries
+agentops-memory
+*.exe
+
+# Test databases
+*.db
+
+# Go
+vendor/
