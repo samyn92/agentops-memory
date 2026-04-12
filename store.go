@@ -412,7 +412,6 @@ func (s *Store) Search(query, project, obsType, scope string, limit int) ([]Sear
 			"%"+query+"%", project, limit,
 		)
 		if err == nil {
-			defer rows.Close()
 			for rows.Next() {
 				var r SearchResult
 				var tk sql.NullString
@@ -423,6 +422,7 @@ func (s *Store) Search(query, project, obsType, scope string, limit int) ([]Sear
 					seen[r.ID] = true
 				}
 			}
+			rows.Close() // Close explicitly before phase 2 to avoid deadlock with MaxOpenConns(1)
 		}
 	}
 
