@@ -57,7 +57,7 @@ func main() {
 	server := NewServer(store)
 	httpServer := &http.Server{
 		Addr:         cfg.ListenAddr,
-		Handler:      server,
+		Handler:      traceContextMiddleware(server),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,

@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -26,6 +25,7 @@ const (
 	maxTagLen     = 100
 	maxTagCount   = 20
 	maxProjectLen = 200
+	maxQueryLimit = 1000 // maximum rows any list/search endpoint can return
 )
 
 // Server is the HTTP handler for the memory service.
@@ -92,7 +92,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 
 	var req CreateSessionRequest
 	if err := decodeJSON(r, &req); err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -100,7 +100,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	// Validate required fields
 	if errs := validateSession(&req); len(errs) > 0 {
 		msg := "validation failed: " + strings.Join(errs, "; ")
-		span.SetStatus(codes.Error, msg)
+		recordError(span, fmt.Errorf("%s", msg))
 		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
@@ -112,7 +112,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 
 	sess, err := s.store.CreateSession(req)
 	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -132,7 +132,7 @@ func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
 
 	var req EndSessionRequest
 	if err := decodeJSON(r, &req); err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -141,7 +141,7 @@ func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.store.EndSession(sessionID, req.Messages)
 	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -163,7 +163,7 @@ func (s *Server) handleRecentSessions(w http.ResponseWriter, r *http.Request) {
 
 	sessions, err := s.store.RecentSessions(project, limit)
 	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -182,7 +182,7 @@ func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
 
 	var req CreateObservationRequest
 	if err := decodeJSON(r, &req); err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -190,7 +190,7 @@ func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
 	// Validate required fields
 	if errs := validateObservation(&req); len(errs) > 0 {
 		msg := "validation failed: " + strings.Join(errs, "; ")
-		span.SetStatus(codes.Error, msg)
+		recordError(span, fmt.Errorf("%s", msg))
 		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
@@ -200,9 +200,9 @@ func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
 		attrObsType.String(req.Type),
 	)
 
-	resp, err := s.store.AddObservation(req)
+	resp, err := s.store.AddObservation(ctx, req)
 	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -233,7 +233,7 @@ func (s *Server) handleRecentObservations(w http.ResponseWriter, r *http.Request
 
 	observations, err := s.store.RecentObservations(project, obsType, scope, limit)
 	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -259,7 +259,7 @@ func (s *Server) handleGetObservation(w http.ResponseWriter, r *http.Request) {
 
 	obs, err := s.store.GetObservation(id)
 	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusNotFound, "observation not found")
 		return
 	}
@@ -282,14 +282,14 @@ func (s *Server) handleUpdateObservation(w http.ResponseWriter, r *http.Request)
 
 	var req UpdateObservationRequest
 	if err := decodeJSON(r, &req); err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	obs, err := s.store.UpdateObservation(id, req)
 	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -316,7 +316,7 @@ func (s *Server) handleDeleteObservation(w http.ResponseWriter, r *http.Request)
 	defer span.End()
 
 	if err := s.store.DeleteObservation(id, hard); err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -334,7 +334,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	scope := r.URL.Query().Get("scope")
 	limit := queryInt(r, "limit", 10)
 
-	_, span := tracer.Start(r.Context(), "memory.search",
+	ctx, span := tracer.Start(r.Context(), "memory.search",
 		trace.WithAttributes(
 			attrMemoryOp.String("search"),
 			attrMemoryProject.String(project),
@@ -342,9 +342,9 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		))
 	defer span.End()
 
-	results, err := s.store.Search(query, project, obsType, scope, limit)
+	results, err := s.store.Search(ctx, query, project, obsType, scope, limit)
 	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -376,26 +376,33 @@ func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(r, "limit", 5)
 
 	queryUsed := query != ""
-	_, span := tracer.Start(r.Context(), "memory.fetch_context",
+	ctx, span := tracer.Start(r.Context(), "memory.fetch_context",
 		trace.WithAttributes(
 			attrMemoryOp.String("fetch_context"),
 			attrMemoryProject.String(project),
 			attrContextQueryUsed.Bool(queryUsed),
+			attrGenAIOperationName.String("retrieval"),
 		))
 	defer span.End()
 
 	if queryUsed {
-		span.SetAttributes(attrMemoryQuery.String(truncateForAttr(query, 500)))
+		span.SetAttributes(
+			attrMemoryQuery.String(truncateForAttr(query, 500)),
+			attrGenAIRetrievalQuery.String(truncateForAttr(query, 500)),
+		)
 	}
 
-	resp, injectionDetails, err := s.store.FetchContext(project, scope, query, limit)
+	resp, injectionDetails, err := s.store.FetchContext(ctx, project, scope, query, limit)
 	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	span.SetAttributes(attrContextResultCount.Int(len(resp.RecentObservations)))
+	span.SetAttributes(
+		attrContextResultCount.Int(len(resp.RecentObservations)),
+		attrGenAIRetrievalDocCount.Int(len(resp.RecentObservations)),
+	)
 
 	// Record each injected observation as a span event.
 	// This is the critical OTEL data — you can see exactly what the agent gets
@@ -455,7 +462,7 @@ func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 
 	entries, err := s.store.Timeline(obsID, before, after)
 	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		if strings.Contains(err.Error(), "not found") {
 			writeError(w, http.StatusNotFound, err.Error())
 		} else {
@@ -483,7 +490,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	stats, err := s.store.Stats(project)
 	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -504,7 +511,7 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 
 	data, err := s.store.Export(project)
 	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -518,17 +525,22 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 
 	var data ExportData
 	if err := decodeJSON(r, &data); err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	result, err := s.store.Import(data)
 	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
+		recordError(span, err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	span.SetAttributes(
+		attribute.Int("memory.import.sessions", result.ImportedSessions),
+		attribute.Int("memory.import.observations", result.ImportedObservations),
+	)
 
 	slog.InfoContext(ctx, "import completed",
 		"sessions", result.ImportedSessions,
@@ -625,6 +637,12 @@ func queryInt(r *http.Request, key string, defaultVal int) int {
 	v, err := strconv.Atoi(s)
 	if err != nil {
 		return defaultVal
+	}
+	if v > maxQueryLimit {
+		v = maxQueryLimit
+	}
+	if v < 0 {
+		v = defaultVal
 	}
 	return v
 }

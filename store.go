@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
@@ -9,44 +10,79 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	_ "modernc.org/sqlite"
 )
 
 // Store wraps the SQLite database with all memory operations.
+// Uses separate read/write connection pools to allow WAL concurrency.
 type Store struct {
-	db           *sql.DB
+	db           *sql.DB // write pool (MaxOpenConns=1, serialized writes)
+	rdb          *sql.DB // read pool (concurrent reads via WAL)
 	dedupeWindow time.Duration
 }
 
 // NewStore opens (or creates) the SQLite database and runs migrations.
 func NewStore(dbPath string, dedupeWindow time.Duration) (*Store, error) {
-	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_foreign_keys=ON&_busy_timeout=5000")
-	if err != nil {
-		return nil, fmt.Errorf("open database: %w", err)
-	}
-	// Single writer, multiple readers.
-	db.SetMaxOpenConns(1)
+	dsn := dbPath + "?_journal_mode=WAL&_foreign_keys=ON&_busy_timeout=5000"
 
-	s := &Store{db: db, dedupeWindow: dedupeWindow}
+	// Write pool: single connection to serialize writes.
+	wdb, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open write database: %w", err)
+	}
+	wdb.SetMaxOpenConns(1)
+
+	// Read pool: allow concurrent readers (WAL supports this).
+	rdb, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		wdb.Close()
+		return nil, fmt.Errorf("open read database: %w", err)
+	}
+	rdb.SetMaxOpenConns(4)
+
+	s := &Store{db: wdb, rdb: rdb, dedupeWindow: dedupeWindow}
 	if err := s.migrate(); err != nil {
-		db.Close()
+		wdb.Close()
+		rdb.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	if err := s.initFTS(); err != nil {
-		db.Close()
+		wdb.Close()
+		rdb.Close()
 		return nil, fmt.Errorf("init FTS5: %w", err)
 	}
 	return s, nil
 }
 
-// Close shuts down the database.
-func (s *Store) Close() error { return s.db.Close() }
+// Close shuts down both database pools.
+func (s *Store) Close() error {
+	s.rdb.Close()
+	return s.db.Close()
+}
 
 // ---------- Schema ----------
 
 func (s *Store) migrate() error {
-	_, err := s.db.Exec(schema)
-	return err
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+	// Incremental migrations (idempotent).
+	for _, m := range migrations {
+		if _, err := s.db.Exec(m); err != nil {
+			return fmt.Errorf("migration: %w", err)
+		}
+	}
+	return nil
+}
+
+// migrations are run in order after the base schema. Each must be idempotent.
+var migrations = []string{
+	// #29: unique index on topic_key for dedup safety.
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_obs_topic_unique
+	 ON observations(topic_key, project, scope)
+	 WHERE topic_key IS NOT NULL AND deleted_at IS NULL`,
 }
 
 const schema = `
@@ -96,7 +132,8 @@ func (s *Store) initFTS() error {
 	var name string
 	err := s.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='observations_fts'`).Scan(&name)
 	if err == nil {
-		return nil // already exists
+		// FTS table exists — ensure trigger is up to date (#27: soft-delete-aware).
+		return s.upgradeFTSTrigger()
 	}
 
 	fts := `
@@ -115,17 +152,38 @@ CREATE TRIGGER observations_ad AFTER DELETE ON observations BEGIN
     INSERT INTO observations_fts(observations_fts, rowid, title, content, type, project, topic_key)
     VALUES ('delete', old.id, old.title, old.content, old.type, old.project, old.topic_key);
 END;
-CREATE TRIGGER observations_au AFTER UPDATE ON observations BEGIN
-    INSERT INTO observations_fts(observations_fts, rowid, title, content, type, project, topic_key)
-    VALUES ('delete', old.id, old.title, old.content, old.type, old.project, old.topic_key);
-    INSERT INTO observations_fts(rowid, title, content, type, project, topic_key)
-    VALUES (new.id, new.title, new.content, new.type, new.project, new.topic_key);
-END;
+` + ftsTriggerUpdate + `
 
 -- Rebuild index from existing data (idempotent on empty table).
 INSERT INTO observations_fts(observations_fts) VALUES('rebuild');
 `
 	_, err = s.db.Exec(fts)
+	return err
+}
+
+// ftsTriggerUpdate is the AFTER UPDATE trigger that handles soft-deletes.
+// When deleted_at becomes non-NULL, we only delete from FTS (don't re-insert).
+const ftsTriggerUpdate = `
+CREATE TRIGGER observations_au AFTER UPDATE ON observations BEGIN
+    -- Remove old content from FTS index.
+    INSERT INTO observations_fts(observations_fts, rowid, title, content, type, project, topic_key)
+    VALUES ('delete', old.id, old.title, old.content, old.type, old.project, old.topic_key);
+    -- Only re-insert if NOT soft-deleted.
+    INSERT INTO observations_fts(rowid, title, content, type, project, topic_key)
+    SELECT new.id, new.title, new.content, new.type, new.project, new.topic_key
+    WHERE new.deleted_at IS NULL;
+END;
+`
+
+// upgradeFTSTrigger drops the old update trigger and recreates it with
+// soft-delete awareness. Idempotent.
+func (s *Store) upgradeFTSTrigger() error {
+	_, err := s.db.Exec(`DROP TRIGGER IF EXISTS observations_au;` + ftsTriggerUpdate)
+	if err != nil {
+		return fmt.Errorf("upgrade FTS trigger: %w", err)
+	}
+	// Rebuild FTS to clean any stale soft-deleted entries.
+	_, err = s.db.Exec(`INSERT INTO observations_fts(observations_fts) VALUES('rebuild')`)
 	return err
 }
 
@@ -141,7 +199,16 @@ func (s *Store) CreateSession(req CreateSessionRequest) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Session{ID: req.ID, Project: project, StartedAt: now}, nil
+	// Read back actual row (may differ on conflict).
+	var sess Session
+	err = s.db.QueryRow(
+		`SELECT id, project, started_at, ended_at, summary, message_count FROM sessions WHERE id = ?`,
+		req.ID,
+	).Scan(&sess.ID, &sess.Project, &sess.StartedAt, &sess.EndedAt, &sess.Summary, &sess.MessageCount)
+	if err != nil {
+		return nil, err
+	}
+	return &sess, nil
 }
 
 func (s *Store) EndSession(sessionID string, messages []SessionMessage) (*EndSessionResponse, error) {
@@ -166,7 +233,7 @@ func (s *Store) RecentSessions(project string, limit int) ([]Session, error) {
 	if limit <= 0 {
 		limit = 5
 	}
-	rows, err := s.db.Query(
+	rows, err := s.rdb.Query(
 		`SELECT id, project, started_at, ended_at, summary, message_count
 		 FROM sessions WHERE project = ? ORDER BY started_at DESC LIMIT ?`,
 		project, limit,
@@ -224,7 +291,15 @@ func buildSessionSummary(messages []SessionMessage) string {
 // ---------- Observations ----------
 
 // AddObservation implements three-tier write: topic_key upsert → hash dedup → new insert.
-func (s *Store) AddObservation(req CreateObservationRequest) (*CreateObservationResponse, error) {
+func (s *Store) AddObservation(ctx context.Context, req CreateObservationRequest) (*CreateObservationResponse, error) {
+	_, span := tracer.Start(ctx, "store.add_observation",
+		trace.WithAttributes(
+			attrMemoryOp.String("add_observation"),
+			attrObsType.String(req.Type),
+			attrMemoryProject.String(req.Project),
+		))
+	defer span.End()
+
 	scope := req.Scope
 	if scope == "" {
 		scope = "project"
@@ -264,6 +339,7 @@ func (s *Store) AddObservation(req CreateObservationRequest) (*CreateObservation
 			}
 			var rev int
 			s.db.QueryRow(`SELECT revision_count FROM observations WHERE id = ?`, existingID).Scan(&rev)
+			span.SetAttributes(attrObsAction.String("updated"), attrObsID.Int64(existingID))
 			return &CreateObservationResponse{ID: existingID, Action: "updated", RevisionCount: rev, DuplicateCount: 1}, nil
 		}
 	}
@@ -290,6 +366,7 @@ func (s *Store) AddObservation(req CreateObservationRequest) (*CreateObservation
 		}
 		var dup int
 		s.db.QueryRow(`SELECT duplicate_count FROM observations WHERE id = ?`, existingID).Scan(&dup)
+		span.SetAttributes(attrObsAction.String("deduplicated"), attrObsID.Int64(existingID))
 		return &CreateObservationResponse{ID: existingID, Action: "deduplicated", RevisionCount: 1, DuplicateCount: dup}, nil
 	}
 
@@ -308,7 +385,7 @@ func (s *Store) AddObservation(req CreateObservationRequest) (*CreateObservation
 }
 
 func (s *Store) GetObservation(id int64) (*Observation, error) {
-	return s.scanObservation(
+	return scanObservationFrom(s.rdb,
 		`SELECT id, session_id, type, title, content, tags, project, scope, topic_key,
 		        normalized_hash, revision_count, duplicate_count, last_seen_at,
 		        promoted_to, created_at, updated_at
@@ -338,7 +415,7 @@ func (s *Store) RecentObservations(project, obsType, scope string, limit int) ([
 	query += ` ORDER BY created_at DESC LIMIT ?`
 	args = append(args, limit)
 
-	return s.scanObservations(query, args...)
+	return scanObservationsFrom(s.rdb, query, args...)
 }
 
 func (s *Store) UpdateObservation(id int64, req UpdateObservationRequest) (*Observation, error) {
@@ -374,7 +451,13 @@ func (s *Store) UpdateObservation(id int64, req UpdateObservationRequest) (*Obse
 	if err != nil {
 		return nil, err
 	}
-	return s.GetObservation(id)
+	// Read back from write pool to guarantee we see our own write.
+	return scanObservationFrom(s.db,
+		`SELECT id, session_id, type, title, content, tags, project, scope, topic_key,
+		        normalized_hash, revision_count, duplicate_count, last_seen_at,
+		        promoted_to, created_at, updated_at
+		 FROM observations WHERE id = ? AND deleted_at IS NULL`, id,
+	)
 }
 
 func (s *Store) DeleteObservation(id int64, hard bool) error {
@@ -391,7 +474,11 @@ func (s *Store) DeleteObservation(id int64, hard bool) error {
 
 // Search performs FTS5 full-text search with BM25 relevance ranking.
 // Returns results ordered by relevance (lower rank = more relevant).
-func (s *Store) Search(query, project, obsType, scope string, limit int) ([]SearchResult, error) {
+func (s *Store) Search(ctx context.Context, query, project, obsType, scope string, limit int) ([]SearchResult, error) {
+	_, span := tracer.Start(ctx, "store.search",
+		trace.WithAttributes(attrMemoryOp.String("search"), attrMemoryQuery.String(truncateForAttr(query, 200))))
+	defer span.End()
+
 	if limit <= 0 {
 		limit = 10
 	}
@@ -405,7 +492,7 @@ func (s *Store) Search(query, project, obsType, scope string, limit int) ([]Sear
 
 	// Phase 1: direct topic_key match (if query contains a slash — likely a topic path).
 	if strings.Contains(query, "/") {
-		rows, err := s.db.Query(
+		rows, err := s.rdb.Query(
 			`SELECT id, type, title, content, topic_key FROM observations
 			 WHERE topic_key LIKE ? AND project = ? AND deleted_at IS NULL
 			 ORDER BY updated_at DESC LIMIT ?`,
@@ -448,7 +535,7 @@ func (s *Store) Search(query, project, obsType, scope string, limit int) ([]Sear
 	ftsQuery += ` ORDER BY rank LIMIT ?`
 	ftsArgs = append(ftsArgs, limit)
 
-	rows, err := s.db.Query(ftsQuery, ftsArgs...)
+	rows, err := s.rdb.Query(ftsQuery, ftsArgs...)
 	if err != nil {
 		return results, err // return topic_key results even if FTS fails
 	}
@@ -476,7 +563,16 @@ func (s *Store) Search(query, project, obsType, scope string, limit int) ([]Sear
 
 // FetchContext returns observations and session summaries for injection into the agent prompt.
 // When query is non-empty, uses FTS5 BM25 for relevance ranking. Otherwise falls back to recency.
-func (s *Store) FetchContext(project, scope, query string, limit int) (*ContextResponse, []ContextInjectionDetail, error) {
+func (s *Store) FetchContext(ctx context.Context, project, scope, query string, limit int) (*ContextResponse, []ContextInjectionDetail, error) {
+	ctx, span := tracer.Start(ctx, "store.fetch_context",
+		trace.WithAttributes(
+			attrMemoryOp.String("fetch_context"),
+			attrMemoryProject.String(project),
+			attrContextQueryUsed.Bool(query != ""),
+			attrGenAIOperationName.String("retrieval"),
+		))
+	defer span.End()
+
 	if limit <= 0 {
 		limit = 5
 	}
@@ -485,7 +581,7 @@ func (s *Store) FetchContext(project, scope, query string, limit int) (*ContextR
 	var injectionDetails []ContextInjectionDetail
 
 	// 1. Recent session summaries (always recency-based).
-	sessRows, err := s.db.Query(
+	sessRows, err := s.rdb.Query(
 		`SELECT summary FROM sessions
 		 WHERE project = ? AND summary IS NOT NULL AND summary != ''
 		 ORDER BY started_at DESC LIMIT 3`,
@@ -517,7 +613,7 @@ func (s *Store) FetchContext(project, scope, query string, limit int) (*ContextR
 			obsQuery += ` ORDER BY rank LIMIT ?`
 			obsArgs = append(obsArgs, limit)
 
-			rows, err := s.db.Query(obsQuery, obsArgs...)
+			rows, err := s.rdb.Query(obsQuery, obsArgs...)
 			if err == nil {
 				defer rows.Close()
 				for rows.Next() {
@@ -573,7 +669,7 @@ func (s *Store) backfillRecent(project, scope string, limit int, exclude map[int
 	query += ` ORDER BY created_at DESC LIMIT ?`
 	args = append(args, limit+len(exclude)) // over-fetch to account for exclusions
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.rdb.Query(query, args...)
 	if err != nil {
 		return
 	}
@@ -626,7 +722,7 @@ func (s *Store) Timeline(observationID int64, before, after int) ([]TimelineEntr
 
 	// Get the anchor observation's created_at and project.
 	var anchorTime, project string
-	err := s.db.QueryRow(
+	err := s.rdb.QueryRow(
 		`SELECT created_at, project FROM observations WHERE id = ? AND deleted_at IS NULL`,
 		observationID,
 	).Scan(&anchorTime, &project)
@@ -635,7 +731,7 @@ func (s *Store) Timeline(observationID int64, before, after int) ([]TimelineEntr
 	}
 
 	// Before (older).
-	beforeRows, err := s.db.Query(
+	beforeRows, err := s.rdb.Query(
 		`SELECT id, type, title, content, created_at FROM observations
 		 WHERE project = ? AND created_at < ? AND deleted_at IS NULL
 		 ORDER BY created_at DESC LIMIT ?`,
@@ -661,14 +757,14 @@ func (s *Store) Timeline(observationID int64, before, after int) ([]TimelineEntr
 
 	// The anchor itself.
 	var anchor TimelineEntry
-	s.db.QueryRow(
+	s.rdb.QueryRow(
 		`SELECT id, type, title, content, created_at FROM observations WHERE id = ?`,
 		observationID,
 	).Scan(&anchor.ID, &anchor.Type, &anchor.Title, &anchor.Content, &anchor.CreatedAt)
 	entries = append(entries, anchor)
 
 	// After (newer).
-	afterRows, err := s.db.Query(
+	afterRows, err := s.rdb.Query(
 		`SELECT id, type, title, content, created_at FROM observations
 		 WHERE project = ? AND created_at > ? AND deleted_at IS NULL
 		 ORDER BY created_at ASC LIMIT ?`,
@@ -693,14 +789,14 @@ func (s *Store) Stats(project string) (*Stats, error) {
 	stats := &Stats{}
 
 	if project != "" {
-		s.db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE project = ?`, project).Scan(&stats.TotalSessions)
-		s.db.QueryRow(`SELECT COUNT(*) FROM observations WHERE project = ? AND deleted_at IS NULL`, project).Scan(&stats.TotalObservations)
+		s.rdb.QueryRow(`SELECT COUNT(*) FROM sessions WHERE project = ?`, project).Scan(&stats.TotalSessions)
+		s.rdb.QueryRow(`SELECT COUNT(*) FROM observations WHERE project = ? AND deleted_at IS NULL`, project).Scan(&stats.TotalObservations)
 	} else {
-		s.db.QueryRow(`SELECT COUNT(*) FROM sessions`).Scan(&stats.TotalSessions)
-		s.db.QueryRow(`SELECT COUNT(*) FROM observations WHERE deleted_at IS NULL`).Scan(&stats.TotalObservations)
+		s.rdb.QueryRow(`SELECT COUNT(*) FROM sessions`).Scan(&stats.TotalSessions)
+		s.rdb.QueryRow(`SELECT COUNT(*) FROM observations WHERE deleted_at IS NULL`).Scan(&stats.TotalObservations)
 	}
 
-	rows, err := s.db.Query(`SELECT DISTINCT project FROM sessions ORDER BY project`)
+	rows, err := s.rdb.Query(`SELECT DISTINCT project FROM sessions ORDER BY project`)
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
@@ -732,7 +828,7 @@ func (s *Store) Export(project string) (*ExportData, error) {
 	}
 	sessQuery += ` ORDER BY started_at`
 
-	rows, err := s.db.Query(sessQuery, sessArgs...)
+	rows, err := s.rdb.Query(sessQuery, sessArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -756,7 +852,7 @@ func (s *Store) Export(project string) (*ExportData, error) {
 	}
 	obsQuery += ` ORDER BY created_at`
 
-	observations, err := s.scanObservations(obsQuery, obsArgs...)
+	observations, err := scanObservationsFrom(s.rdb, obsQuery, obsArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -819,10 +915,17 @@ func (s *Store) Import(data ExportData) (*ImportResult, error) {
 
 // ---------- Helpers ----------
 
-func (s *Store) scanObservation(query string, args ...any) (*Observation, error) {
+// querier abstracts *sql.DB for read operations so callers can choose
+// the read pool (s.rdb) or write pool (s.db) as needed.
+type querier interface {
+	QueryRow(query string, args ...any) *sql.Row
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+func scanObservationFrom(q querier, query string, args ...any) (*Observation, error) {
 	var obs Observation
 	var tagsJSON, topicKey, hash, lastSeen, promotedTo sql.NullString
-	err := s.db.QueryRow(query, args...).Scan(
+	err := q.QueryRow(query, args...).Scan(
 		&obs.ID, &obs.SessionID, &obs.Type, &obs.Title, &obs.Content, &tagsJSON,
 		&obs.Project, &obs.Scope, &topicKey, &hash,
 		&obs.RevisionCount, &obs.DuplicateCount, &lastSeen,
@@ -841,8 +944,8 @@ func (s *Store) scanObservation(query string, args ...any) (*Observation, error)
 	return &obs, nil
 }
 
-func (s *Store) scanObservations(query string, args ...any) ([]Observation, error) {
-	rows, err := s.db.Query(query, args...)
+func scanObservationsFrom(q querier, query string, args ...any) ([]Observation, error) {
+	rows, err := q.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -893,11 +996,12 @@ func normalizeHash(content string) string {
 	return fmt.Sprintf("%x", h)
 }
 
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
+func truncate(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
 		return s
 	}
-	return s[:maxLen] + "..."
+	return string(runes[:maxRunes]) + "..."
 }
 
 func nilIfEmpty(s string) *string {

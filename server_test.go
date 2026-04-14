@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -276,10 +277,10 @@ func TestDedupWindow_ShortWindow(t *testing.T) {
 
 	createTestSession(t, store, "s1", "proj")
 
-	resp1, _ := store.AddObservation(CreateObservationRequest{
+	resp1, _ := store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1", Type: "decision", Title: "Test", Content: "Same content", Project: "proj",
 	})
-	resp2, _ := store.AddObservation(CreateObservationRequest{
+	resp2, _ := store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1", Type: "decision", Title: "Test", Content: "Same content", Project: "proj",
 	})
 

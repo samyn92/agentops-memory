@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -26,7 +29,6 @@ var (
 	attrMemoryQuery   = attribute.Key("memory.query")
 
 	// Context injection tracing — the key spans for checking relevancy.
-	attrContextMethod      = attribute.Key("memory.context.method")       // fts5_bm25 or recency
 	attrContextResultCount = attribute.Key("memory.context.result_count") // how many injected
 	attrContextQueryUsed   = attribute.Key("memory.context.query_used")   // was a query provided?
 
@@ -40,6 +42,11 @@ var (
 	// Search tracing.
 	attrSearchQuery       = attribute.Key("memory.search.query")
 	attrSearchResultCount = attribute.Key("memory.search.result_count")
+
+	// GenAI retrieval semantic conventions (OTEL GenAI spec).
+	attrGenAIOperationName     = attribute.Key("gen_ai.operation.name")
+	attrGenAIRetrievalQuery    = attribute.Key("gen_ai.retrieval.query.text")
+	attrGenAIRetrievalDocCount = attribute.Key("gen_ai.retrieval.document_count")
 
 	// Observation write tracing.
 	attrObsAction = attribute.Key("memory.observation.action") // created, updated, deduplicated
@@ -102,4 +109,46 @@ func initTracing(ctx context.Context) (*tracingFuncs, error) {
 		ForceFlush: tp.ForceFlush,
 		Shutdown:   tp.Shutdown,
 	}, nil
+}
+
+// traceContextMiddleware extracts W3C traceparent from incoming HTTP requests
+// and injects the remote span context into the request context. This connects
+// memory service spans to the calling agent's trace — the critical link for
+// distributed tracing across runtime → memory.
+func traceContextMiddleware(next http.Handler) http.Handler {
+	propagator := propagation.TraceContext{}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := propagator.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// recordError sets the span status to Error, records the error as an event,
+// and sets error.type per OTel semantic conventions.
+func recordError(span trace.Span, err error) {
+	span.SetStatus(codes.Error, err.Error())
+	span.RecordError(err)
+	span.SetAttributes(attribute.String("error.type", memErrorType(err)))
+}
+
+// memErrorType classifies an error into a short error.type string.
+func memErrorType(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "not found"):
+		return "not_found"
+	case strings.Contains(s, "database is locked"):
+		return "db_locked"
+	case strings.Contains(s, "constraint"):
+		return "constraint_violation"
+	case strings.Contains(s, "validation"):
+		return "validation_error"
+	case strings.Contains(s, "invalid JSON"):
+		return "invalid_input"
+	default:
+		return "error"
+	}
 }

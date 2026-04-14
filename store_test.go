@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -135,7 +136,7 @@ func TestAddObservation_Tier3_NewInsert(t *testing.T) {
 	store := newTestStore(t)
 	createTestSession(t, store, "s1", "proj")
 
-	resp, err := store.AddObservation(CreateObservationRequest{
+	resp, err := store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "decision",
 		Title:     "Chose Go over Rust",
@@ -161,7 +162,7 @@ func TestAddObservation_Tier1_TopicKeyUpsert(t *testing.T) {
 	createTestSession(t, store, "s1", "proj")
 
 	// First insert with topic_key
-	resp1, err := store.AddObservation(CreateObservationRequest{
+	resp1, err := store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "config",
 		Title:     "DB pool size",
@@ -177,7 +178,7 @@ func TestAddObservation_Tier1_TopicKeyUpsert(t *testing.T) {
 	}
 
 	// Second insert with same topic_key should upsert
-	resp2, err := store.AddObservation(CreateObservationRequest{
+	resp2, err := store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "config",
 		Title:     "DB pool size updated",
@@ -216,7 +217,7 @@ func TestAddObservation_Tier2_HashDedup(t *testing.T) {
 	createTestSession(t, store, "s1", "proj")
 
 	// First insert (no topic_key)
-	resp1, err := store.AddObservation(CreateObservationRequest{
+	resp1, err := store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "discovery",
 		Title:     "Found a bug",
@@ -231,7 +232,7 @@ func TestAddObservation_Tier2_HashDedup(t *testing.T) {
 	}
 
 	// Exact same content should be deduplicated
-	resp2, err := store.AddObservation(CreateObservationRequest{
+	resp2, err := store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "discovery",
 		Title:     "Found a bug",
@@ -256,7 +257,7 @@ func TestAddObservation_Tier2_CaseInsensitiveDedup(t *testing.T) {
 	store := newTestStore(t)
 	createTestSession(t, store, "s1", "proj")
 
-	store.AddObservation(CreateObservationRequest{
+	store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "discovery",
 		Title:     "Test",
@@ -265,7 +266,7 @@ func TestAddObservation_Tier2_CaseInsensitiveDedup(t *testing.T) {
 	})
 
 	// Same content, different case → should dedup (hash is case-insensitive)
-	resp, _ := store.AddObservation(CreateObservationRequest{
+	resp, _ := store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "discovery",
 		Title:     "Test",
@@ -282,7 +283,7 @@ func TestAddObservation_DifferentProjectNotDeduped(t *testing.T) {
 	createTestSession(t, store, "s1", "proj1")
 	createTestSession(t, store, "s2", "proj2")
 
-	store.AddObservation(CreateObservationRequest{
+	store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "discovery",
 		Title:     "Same title",
@@ -290,7 +291,7 @@ func TestAddObservation_DifferentProjectNotDeduped(t *testing.T) {
 		Project:   "proj1",
 	})
 
-	resp, _ := store.AddObservation(CreateObservationRequest{
+	resp, _ := store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s2",
 		Type:      "discovery",
 		Title:     "Same title",
@@ -310,7 +311,7 @@ func TestGetObservation(t *testing.T) {
 	store := newTestStore(t)
 	createTestSession(t, store, "s1", "proj")
 
-	resp, _ := store.AddObservation(CreateObservationRequest{
+	resp, _ := store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "decision",
 		Title:     "Test obs",
@@ -335,7 +336,7 @@ func TestUpdateObservation(t *testing.T) {
 	store := newTestStore(t)
 	createTestSession(t, store, "s1", "proj")
 
-	resp, _ := store.AddObservation(CreateObservationRequest{
+	resp, _ := store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "decision",
 		Title:     "Original",
@@ -365,7 +366,7 @@ func TestDeleteObservation_Soft(t *testing.T) {
 	store := newTestStore(t)
 	createTestSession(t, store, "s1", "proj")
 
-	resp, _ := store.AddObservation(CreateObservationRequest{
+	resp, _ := store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "decision",
 		Title:     "To delete",
@@ -389,7 +390,7 @@ func TestDeleteObservation_Hard(t *testing.T) {
 	store := newTestStore(t)
 	createTestSession(t, store, "s1", "proj")
 
-	resp, _ := store.AddObservation(CreateObservationRequest{
+	resp, _ := store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "decision",
 		Title:     "To delete hard",
@@ -416,14 +417,14 @@ func TestSearch_FTS5(t *testing.T) {
 	store := newTestStore(t)
 	createTestSession(t, store, "s1", "proj")
 
-	store.AddObservation(CreateObservationRequest{
+	store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "decision",
 		Title:     "Database architecture",
 		Content:   "Chose SQLite with FTS5 for full-text search capabilities.",
 		Project:   "proj",
 	})
-	store.AddObservation(CreateObservationRequest{
+	store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "bugfix",
 		Title:     "Fixed API timeout",
@@ -431,7 +432,7 @@ func TestSearch_FTS5(t *testing.T) {
 		Project:   "proj",
 	})
 
-	results, err := store.Search("SQLite", "proj", "", "", 10)
+	results, err := store.Search(context.Background(), "SQLite", "proj", "", "", 10)
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
@@ -447,7 +448,7 @@ func TestSearch_PorterStemming(t *testing.T) {
 	store := newTestStore(t)
 	createTestSession(t, store, "s1", "proj")
 
-	store.AddObservation(CreateObservationRequest{
+	store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "discovery",
 		Title:     "Running processes",
@@ -456,7 +457,7 @@ func TestSearch_PorterStemming(t *testing.T) {
 	})
 
 	// "run" should match "running" via porter stemmer
-	results, _ := store.Search("run goroutine", "proj", "", "", 10)
+	results, _ := store.Search(context.Background(), "run goroutine", "proj", "", "", 10)
 	if len(results) == 0 {
 		t.Fatal("expected porter stemming to match 'run' → 'running'")
 	}
@@ -466,7 +467,7 @@ func TestSearch_TopicKeyMatch(t *testing.T) {
 	store := newTestStore(t)
 	createTestSession(t, store, "s1", "proj")
 
-	store.AddObservation(CreateObservationRequest{
+	store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "config",
 		Title:     "Pool size",
@@ -476,7 +477,7 @@ func TestSearch_TopicKeyMatch(t *testing.T) {
 	})
 
 	// Search with a topic-like query (contains /)
-	results, _ := store.Search("config/db", "proj", "", "", 10)
+	results, _ := store.Search(context.Background(), "config/db", "proj", "", "", 10)
 	if len(results) == 0 {
 		t.Fatal("expected topic_key LIKE match for 'config/db'")
 	}
@@ -490,14 +491,14 @@ func TestFetchContext_WithQuery(t *testing.T) {
 	store := newTestStore(t)
 	createTestSession(t, store, "s1", "proj")
 
-	store.AddObservation(CreateObservationRequest{
+	store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "decision",
 		Title:     "Memory architecture",
 		Content:   "Three-layer memory model with SQLite backend.",
 		Project:   "proj",
 	})
-	store.AddObservation(CreateObservationRequest{
+	store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "bugfix",
 		Title:     "Fixed login bug",
@@ -510,7 +511,7 @@ func TestFetchContext_WithQuery(t *testing.T) {
 		{Role: "user", Content: "Let's work on memory"},
 	})
 
-	ctx, _, err := store.FetchContext("proj", "", "memory", 5)
+	ctx, _, err := store.FetchContext(context.Background(), "proj", "", "memory", 5)
 	if err != nil {
 		t.Fatalf("FetchContext: %v", err)
 	}
@@ -527,14 +528,14 @@ func TestFetchContext_WithoutQuery_RecencyFallback(t *testing.T) {
 	store := newTestStore(t)
 	createTestSession(t, store, "s1", "proj")
 
-	store.AddObservation(CreateObservationRequest{
+	store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "decision",
 		Title:     "First observation",
 		Content:   "This was first",
 		Project:   "proj",
 	})
-	store.AddObservation(CreateObservationRequest{
+	store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1",
 		Type:      "decision",
 		Title:     "Second observation",
@@ -542,7 +543,7 @@ func TestFetchContext_WithoutQuery_RecencyFallback(t *testing.T) {
 		Project:   "proj",
 	})
 
-	ctx, _, err := store.FetchContext("proj", "", "", 5)
+	ctx, _, err := store.FetchContext(context.Background(), "proj", "", "", 5)
 	if err != nil {
 		t.Fatalf("FetchContext: %v", err)
 	}
@@ -560,10 +561,10 @@ func TestStats(t *testing.T) {
 	createTestSession(t, store, "s1", "proj1")
 	createTestSession(t, store, "s2", "proj2")
 
-	store.AddObservation(CreateObservationRequest{
+	store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1", Type: "decision", Title: "T1", Content: "C1", Project: "proj1",
 	})
-	store.AddObservation(CreateObservationRequest{
+	store.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s2", Type: "bugfix", Title: "T2", Content: "C2", Project: "proj2",
 	})
 
@@ -585,7 +586,7 @@ func TestStats(t *testing.T) {
 func TestExportImport_RoundTrip(t *testing.T) {
 	store1 := newTestStore(t)
 	createTestSession(t, store1, "s1", "proj")
-	store1.AddObservation(CreateObservationRequest{
+	store1.AddObservation(context.Background(), CreateObservationRequest{
 		SessionID: "s1", Type: "decision", Title: "Test", Content: "Content", Project: "proj",
 	})
 
@@ -627,7 +628,7 @@ func TestTimeline(t *testing.T) {
 
 	var ids []int64
 	for i := 0; i < 5; i++ {
-		resp, _ := store.AddObservation(CreateObservationRequest{
+		resp, _ := store.AddObservation(context.Background(), CreateObservationRequest{
 			SessionID: "s1",
 			Type:      "decision",
 			Title:     "Obs " + string(rune('A'+i)),
